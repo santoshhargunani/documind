@@ -23,3 +23,10 @@ module "ingestion" {
   region               = var.region
   raw_docs_bucket_name = "${var.project_id}-documind-raw-docs"
 }
+
+module "artifact_registry" {
+  source = "../../modules/artifact_registry"
+
+  project_id = var.project_id
+  region     = var.region
+}

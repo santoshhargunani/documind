@@ -29,3 +29,7 @@ output "docai_processor_id" {
 output "public_ip_address" {
   value = module.cloudsql.public_ip_address
 }
+
+output "artifact_registry_url" {
+  value = module.artifact_registry.repository_url
+}
