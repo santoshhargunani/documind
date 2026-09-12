@@ -26,6 +26,10 @@ resource "google_compute_subnetwork" "subnet" {
     range_name    = "services"
     ip_cidr_range = var.services_cidr
   }
+
+  lifecycle {
+    ignore_changes = [secondary_ip_range]
+  }
 }
 
 # Reserved IP range for VPC peering with Google's managed services

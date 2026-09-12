@@ -33,3 +33,11 @@ output "public_ip_address" {
 output "artifact_registry_url" {
   value = module.artifact_registry.repository_url
 }
+
+output "gsa_email" {
+  value = module.workload_identity.gsa_email
+}
+
+output "gke_cluster_name" {
+  value = module.gke.cluster_name
+}

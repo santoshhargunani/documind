@@ -30,3 +30,20 @@ module "artifact_registry" {
   project_id = var.project_id
   region     = var.region
 }
+
+module "workload_identity" {
+  source = "../../modules/workload_identity"
+
+  project_id = var.project_id
+}
+
+module "gke" {
+  source = "../../modules/gke"
+
+  project_id   = var.project_id
+  region       = var.region
+  network_name = module.vpc.network_name
+  subnet_name  = module.vpc.subnet_name
+
+  depends_on = [module.vpc]
+}
