@@ -1,0 +1,112 @@
+# deployment.yaml
+# ----------------
+# Runs the DocuMind API container as a Kubernetes Deployment — a
+# controller that keeps a specified number of pod replicas running,
+# replacing failed pods automatically and supporting rolling updates.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: documind-api
+  namespace: default
+spec:
+  replicas: 1
+  # A single replica for this dev/prep environment — deliberately
+  # minimal since Autopilot bills per-pod resource consumption and
+  # this is a demo/prep project, not a real production workload
+  # needing redundancy. A real production Deployment would run 2+
+  # replicas for availability during rolling updates and node
+  # maintenance.
+
+  selector:
+    matchLabels:
+      app: documind-api
+  # Tells the Deployment which pods it "owns" and should manage — must
+  # match the labels on the pod template below exactly.
+
+  template:
+    metadata:
+      labels:
+        app: documind-api
+        # This label is what the Service (next manifest) uses to find
+        # and route traffic to these pods — labels are Kubernetes'
+        # general-purpose mechanism for loosely coupling resources to
+        # each other, rather than hardcoded references.
+    spec:
+      serviceAccountName: documind-app
+      # THIS is what actually makes a running pod use the Workload
+      # Identity-bound ServiceAccount from service-account.yaml,
+      # rather than Kubernetes' bare "default" ServiceAccount (which
+      # has no GCP permissions bound to it at all). Without this line,
+      # none of the Workload Identity setup from Step 8.3 would take
+      # effect for this pod.
+
+      containers:
+        - name: documind-api
+          image: us-central1-docker.pkg.dev/project-672c834c-460a-4d65-a9b/documind/documind-api:latest
+          # The exact image we pushed to Artifact Registry in Step 8.2.
+          # GKE pulls from here directly — no local image reuse, this
+          # is a genuinely separate pull over the network, which is
+          # also why pushing the image BEFORE deploying (already done)
+          # is a hard prerequisite.
+
+          ports:
+            - containerPort: 8000
+          # Matches the EXPOSE 8000 / uvicorn --port 8000 from our
+          # Dockerfile — informs Kubernetes which port the container
+          # actually listens on, used by the Service and health checks
+          # below.
+
+          envFrom:
+            - configMapRef:
+                name: documind-config
+          # Bulk-injects every key from the ConfigMap as environment
+          # variables — equivalent in spirit to our local --env-file
+          # .env flag for docker run, just sourced from a Kubernetes
+          # object instead of a local file.
+
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "500m"
+              memory: "1Gi"
+          # Autopilot REQUIRES resource requests/limits to be declared
+          # explicitly — unlike GKE Standard, you cannot omit these and
+          # let a node just absorb whatever a pod happens to use.
+          # "requests" is what Autopilot bills for and guarantees is
+          # available; "limits" is the hard ceiling the container can't
+          # exceed. 250m = 0.25 vCPU, a reasonable starting point for a
+          # lightweight FastAPI service whose actual heavy lifting
+          # (LLM calls, DB queries) happens on OTHER services over the
+          # network, not CPU-bound work in this pod itself.
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          # Kubernetes calls GET /health repeatedly (every 15s, after
+          # a 10s initial grace period for startup) — this is exactly
+          # why we built a minimal, cheap /health endpoint back in
+          # Step 7 rather than only having the expensive /ask
+          # endpoint. If this probe fails repeatedly, Kubernetes
+          # assumes the pod is unhealthy/stuck and RESTARTS it
+          # automatically — real self-healing behavior, not something
+          # our application code has to implement itself.
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          # Similar to livenessProbe, but with a different purpose:
+          # readiness controls whether the pod RECEIVES TRAFFIC AT ALL
+          # right now, without necessarily restarting it. A pod can be
+          # alive (liveness passing) but temporarily not ready (e.g.
+          # still warming up a connection pool) — readiness failing
+          # just means Kubernetes stops routing new requests to it
+          # until it passes again, rather than treating it as broken.

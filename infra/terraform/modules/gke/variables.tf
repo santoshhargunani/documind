@@ -24,3 +24,8 @@ variable "subnet_name" {
   type        = string
   description = "Subnet name this cluster's nodes/pods use (from the vpc module)"
 }
+
+variable "project_number" {
+  type        = string
+  description = "GCP project number (numeric), used to construct the default Compute Engine service account email"
+}

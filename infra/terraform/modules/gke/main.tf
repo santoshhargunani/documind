@@ -35,3 +35,9 @@ resource "google_container_cluster" "autopilot" {
   # actually tear this down between sessions. A real production
   # cluster would set this true.
 }
+
+resource "google_project_iam_member" "gke_node_artifact_reader" {
+  project = var.project_id
+  role    = "roles/artifactregistry.reader"
+  member  = "serviceAccount:${var.project_number}-compute@developer.gserviceaccount.com"
+}

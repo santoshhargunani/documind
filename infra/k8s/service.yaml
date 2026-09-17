@@ -1,0 +1,38 @@
+# service.yaml
+# -------------
+# Exposes the DocuMind Deployment's pods as a single, stable network
+# endpoint. Pods are ephemeral (they get replaced, rescheduled, get
+# new internal IPs) — a Service provides a consistent way to reach
+# "whichever pods currently match this label," so nothing else needs
+# to track individual pod IPs directly.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: documind-api
+  namespace: default
+spec:
+  type: LoadBalancer
+  # LoadBalancer provisions an actual external GCP Load Balancer with
+  # a public IP, making this service reachable from outside the
+  # cluster entirely — the right choice for testing that this is a
+  # genuinely working, externally-accessible deployment. (A real
+  # production setup fronting this with a proper API gateway / Ingress
+  # + TLS termination + auth would be a further refinement beyond this
+  # project's current scope — worth naming as the next step if asked.)
+
+  selector:
+    app: documind-api
+  # Matches the label on pods from deployment.yaml — this is the
+  # loose-coupling mechanism mentioned there: the Service doesn't
+  # reference the Deployment directly, it just watches for any pods
+  # carrying this label and routes traffic to them.
+
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8000
+      # External traffic arrives on port 80 (standard HTTP, so no
+      # port number needs to be typed in a URL), and gets forwarded to
+      # port 8000 inside the container — matching containerPort from
+      # deployment.yaml and our uvicorn --port 8000 setting.

@@ -45,5 +45,6 @@ module "gke" {
   network_name = module.vpc.network_name
   subnet_name  = module.vpc.subnet_name
 
-  depends_on = [module.vpc]
+  project_number = "316104585600"
+  depends_on     = [module.vpc]
 }

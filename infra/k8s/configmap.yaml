@@ -1,0 +1,49 @@
+# configmap.yaml
+# ---------------
+# Non-sensitive configuration for the DocuMind pod, injected as
+# environment variables. The DB password is deliberately NOT here —
+# the pod fetches it directly from Secret Manager at runtime via
+# config_secrets.py, exactly like local development does, using its
+# Workload Identity-granted permissions rather than a Kubernetes
+# Secret duplicating what Secret Manager already manages.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: documind-config
+  namespace: default
+data:
+  GCP_PROJECT_ID: "project-672c834c-460a-4d65-a9b"
+  GCP_REGION: "us-central1"
+  RAW_DOCS_BUCKET: "project-672c834c-460a-4d65-a9b-documind-raw-docs"
+  DOCAI_LOCATION: "us"
+  # NOTE: DOCAI_PROCESSOR_ID is intentionally omitted from this static
+  # file — recall it changes every time Terraform recreates the
+  # Document AI processor, the same instability that's required
+  # manual refreshing into .env all project. It must be set here
+  # (or patched in) with today's actual value before deploying — see
+  # the deployment instructions in chat.
+  DB_NAME: "documind"
+  DB_USER: "documind_admin"
+  DB_PORT: "5432"
+  DB_SSLMODE: "disable"
+  # Deliberately DIFFERENT from local dev's "require": once running
+  # inside the VPC over the PRIVATE IP, the connection never traverses
+  # the public internet at all, so enforcing TLS at the Postgres layer
+  # is optional here (VPC-level network isolation is the real security
+  # boundary for this path) — though enabling SSL even on private
+  # connections is a defensible, more conservative choice for a real
+  # production system; documented here as a deliberate simplification
+  # for this project rather than an oversight.
+  DB_INSTANCE_CONNECTION_NAME: "project-672c834c-460a-4d65-a9b:us-central1:documind-postgres"
+  DB_PASSWORD_SECRET_ID: "documind-postgres-password"
+  EMBEDDING_MODEL: "text-embedding-005"
+  CHUNK_SIZE: "1000"
+  CHUNK_OVERLAP: "150"
+  DOCAI_PROCESSOR_ID: "15421e4f5816edb5"
+  DB_HOST: "10.160.0.17"
+  # DB_HOST is also intentionally omitted here — added via a separate
+  # patch step in the deployment instructions, since it's the PRIVATE
+  # IP (terraform output private_ip_address), which is only known
+  # after the Cloud SQL instance's current session values are fetched,
+  # same pattern as every other per-session value in this project.
