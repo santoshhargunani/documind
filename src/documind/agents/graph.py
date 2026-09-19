@@ -27,10 +27,23 @@ from documind.agents.retriever import retrieve_chunks
 from documind.agents.router import route_question
 from documind.agents.state import AgentState
 from documind.agents.synthesis import synthesize_answer
+from documind.tracing import tracer
 # The four agent node functions built in Steps 5.2-5.5, plus the
 # shared AgentState schema from Step 5.1 that the graph is built
 # around.
 
+def _traced(name: str, fn):
+    """
+    Wraps a node function so its execution is captured as a named
+    OpenTelemetry span. This is applied uniformly to every node when
+    the graph is built, rather than modifying each agent file
+    individually — one small addition here instruments the entire
+    graph's timing breakdown at once.
+    """
+    def wrapped(state):
+        with tracer.start_as_current_span(name):
+            return fn(state)
+    return wrapped
 
 # --- SMALL TERMINAL NODES ---
 # The router can decide a question needs "clarify" or "reject"
@@ -128,12 +141,12 @@ def build_graph():
     # updates to.
 
     # --- Register every node ---
-    graph.add_node("router", route_question)
-    graph.add_node("retriever", retrieve_chunks)
-    graph.add_node("synthesis", synthesize_answer)
-    graph.add_node("critic", critique_answer)
-    graph.add_node("clarify", handle_clarify)
-    graph.add_node("reject", handle_reject)
+    graph.add_node("router", _traced("router", route_question))
+    graph.add_node("retriever", _traced("retriever", retrieve_chunks))
+    graph.add_node("synthesis", _traced("synthesis", synthesize_answer))
+    graph.add_node("critic", _traced("critic", critique_answer))
+    graph.add_node("clarify", _traced("clarify", handle_clarify))
+    graph.add_node("reject", _traced("reject", handle_reject))
     # add_node(name, function) registers each node under a string
     # name — this name is what edges (below) refer to. Note the name
     # ("router") doesn't have to match the function name

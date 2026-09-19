@@ -51,8 +51,10 @@ from documind.agents.graph import build_graph
 # The compiled LangGraph StateGraph from Step 5.6 — the exact same
 # object mcp_server.py uses. One graph, two thin interfaces.
 
+from documind.tracing import configure_tracing
 
 # --- LOGGER SETUP ---
+configure_tracing(service_name="documind-api")
 
 logger = structlog.get_logger()
 
