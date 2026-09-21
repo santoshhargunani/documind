@@ -41,3 +41,7 @@ output "gsa_email" {
 output "gke_cluster_name" {
   value = module.gke.cluster_name
 }
+
+output "bq_dataset_id" {
+  value = module.bigquery.dataset_id
+}

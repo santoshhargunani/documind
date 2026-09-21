@@ -48,3 +48,10 @@ module "gke" {
   project_number = "316104585600"
   depends_on     = [module.vpc]
 }
+
+module "bigquery" {
+  source = "../../modules/bigquery"
+
+  project_id = var.project_id
+  region     = var.region
+}

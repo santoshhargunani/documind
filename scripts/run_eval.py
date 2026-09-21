@@ -33,26 +33,7 @@ from documind.eval.golden_dataset import GOLDEN_DATASET, EvalCase
 
 # --- RESULT MODEL ---
 
-class EvalResult(BaseModel):
-    """
-    The outcome of running one EvalCase through the graph — captures
-    everything needed to both report a pass/fail verdict AND diagnose
-    WHY a case failed, without re-running it.
-    """
-
-    question: str
-    passed: bool
-    is_grounded: bool | None
-    retry_count: int
-    latency_seconds: float
-    final_answer: str
-    missing_keywords: list[str]
-    # Which expected keywords, if any, did NOT appear in the answer —
-    # the single most useful field for debugging a failing case,
-    # since it tells you exactly what's missing rather than just
-    # "this failed."
-
-
+from documind.eval.models import EvalResult
 # --- SINGLE-CASE EVALUATION ---
 
 def _evaluate_case(graph, case: EvalCase) -> EvalResult:
@@ -119,9 +100,15 @@ def run_eval_suite() -> list[EvalResult]:
     """
 
     graph = build_graph()
-    return [_evaluate_case(graph, case) for case in GOLDEN_DATASET]
-
-
+    results = []
+    for case in GOLDEN_DATASET:
+        results.append(_evaluate_case(graph, case))
+        time.sleep(5)
+        # Pacing between cases to stay under Vertex AI's per-minute
+        # quota — each case involves several sequential LLM calls
+        # already; running cases with zero gap between them triggered
+        # a real 429 RESOURCE_EXHAUSTED error during testing.
+    return results
 # --- REPORTING ---
 
 def print_report(results: list[EvalResult]) -> None:
@@ -164,5 +151,10 @@ def print_report(results: list[EvalResult]) -> None:
 # --- ENTRY POINT ---
 
 if __name__ == "__main__":
+    from documind.eval.bigquery_writer import write_eval_results_to_bigquery
+
     results = run_eval_suite()
     print_report(results)
+
+    run_id = write_eval_results_to_bigquery(results)
+    print(f"\nResults written to BigQuery (run_id: {run_id})")
