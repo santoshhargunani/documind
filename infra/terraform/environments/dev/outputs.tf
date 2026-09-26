@@ -45,3 +45,11 @@ output "gke_cluster_name" {
 output "bq_dataset_id" {
   value = module.bigquery.dataset_id
 }
+
+output "workload_identity_provider" {
+  value = module.github_ci.workload_identity_provider
+}
+
+output "ci_sa_email" {
+  value = module.github_ci.ci_sa_email
+}

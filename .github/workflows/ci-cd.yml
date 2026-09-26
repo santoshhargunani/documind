@@ -1,0 +1,233 @@
+# ci-cd.yml
+# ---------
+# The full DocuMind pipeline: lint -> type check -> unit tests ->
+# EVAL GATE -> build -> push -> deploy to GKE. Each job only runs if
+# every job it depends on succeeded — a change that fails linting
+# never gets to burn API quota on the eval gate; a change that fails
+# the eval gate never gets built or deployed at all.
+
+name: DocuMind CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+# Runs on every push to main (this is what eventually deploys) AND on
+# every pull request targeting main (this runs everything EXCEPT the
+# deploy job — see the `if` conditions below — giving fast feedback on
+# a PR before it's ever merged, without accidentally deploying
+# someone's in-progress branch).
+
+permissions:
+  contents: read
+  id-token: write
+  # id-token: write is REQUIRED for Workload Identity Federation to
+  # work at all — it's what lets this workflow request the OIDC token
+  # that gets exchanged for GCP credentials in the auth step below.
+  # Without this permission, the whole keyless-auth mechanism from
+  # Step 10.1 simply doesn't function.
+
+env:
+  PROJECT_ID: project-672c834c-460a-4d65-a9b
+  REGION: us-central1
+  WORKLOAD_IDENTITY_PROVIDER: projects/316104585600/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
+  CI_SA_EMAIL: documind-ci@project-672c834c-460a-4d65-a9b.iam.gserviceaccount.com
+  IMAGE: us-central1-docker.pkg.dev/project-672c834c-460a-4d65-a9b/documind/documind-api
+  # Centralized here so every job below references the same values —
+  # avoids the same class of "value drifted between two places" bug
+  # this project has hit repeatedly with manually-updated .env files.
+
+jobs:
+  lint-and-typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          # Pinned to match this project's deliberate Python 3.12
+          # choice from Step 1 — CI must use the exact same version
+          # local development does, or a version-specific bug could
+          # pass locally and fail in CI (or worse, the reverse).
+
+      - name: Install dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Ruff lint
+        run: ruff check src
+
+      - name: Mypy type check
+        run: mypy src
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    needs: lint-and-typecheck
+    # `needs:` makes this job wait for lint-and-typecheck to succeed
+    # first — no point running tests against code that doesn't even
+    # pass basic style/type checks.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[dev]"
+      - name: Run unit tests
+        run: pytest tests/unit -v
+        # Scoped to tests/unit specifically (not tests/integration,
+        # which would need live GCP credentials and real
+        # infrastructure) — unit tests should be fast, isolated, and
+        # runnable with zero external dependencies. This project's
+        # tests/ folder exists in the layout but doesn't have real
+        # unit tests written yet — a known gap worth filling in
+        # before this workflow is fully meaningful, flagged honestly
+        # rather than glossed over.
+
+  eval-gate:
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[dev]"
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.CI_SA_EMAIL }}
+        # THIS is where the keyless auth from Step 10.1 actually
+        # happens: GitHub issues an OIDC token for this specific
+        # workflow run, this action exchanges it (via the Workload
+        # Identity Federation pool/provider) for short-lived GCP
+        # credentials scoped to the documind-ci service account. No
+        # JSON key file, no long-lived secret stored in GitHub at any
+        # point.
+
+      - name: Run eval suite
+        id: run_eval
+        env:
+          GCP_PROJECT_ID: ${{ env.PROJECT_ID }}
+          GCP_REGION: ${{ env.REGION }}
+          RAW_DOCS_BUCKET: project-672c834c-460a-4d65-a9b-documind-raw-docs
+          DOCAI_PROCESSOR_ID: ${{ vars.DOCAI_PROCESSOR_ID }}
+          DOCAI_LOCATION: us
+          DB_HOST: ${{ vars.DB_HOST }}
+          DB_NAME: documind
+          DB_USER: documind_admin
+          DB_PASSWORD_SECRET_ID: documind-postgres-password
+          # DOCAI_PROCESSOR_ID and DB_HOST are pulled from GitHub
+          # Actions "vars" (repository variables, set in GitHub's own
+          # UI) rather than hardcoded here — this is the SAME
+          # per-session-value problem this project has fought with
+          # .env all along (these values change every time Terraform
+          # recreates the underlying resources). In a real persistent
+          # (non-destroy-between-sessions) environment, these would be
+          # STABLE values set once. For this prep project's
+          # destroy/recreate workflow, these GitHub vars would need
+          # manual updating whenever you want CI to run against fresh
+          # infra — an honest limitation worth naming, not hidden.
+        run: python scripts/run_eval.py
+
+      - name: Check eval pass rate
+        run: |
+          python -c "
+          import sys
+          from documind.eval.run_eval import run_eval_suite
+          results = run_eval_suite()
+          passed = sum(1 for r in results if r.passed)
+          total = len(results)
+          pass_rate = passed / total if total else 0
+          print(f'Pass rate: {passed}/{total} ({pass_rate:.0%})')
+          if pass_rate < 0.8:
+              print('EVAL GATE FAILED: pass rate below 80% threshold')
+              sys.exit(1)
+          "
+        # THIS is the actual gate. It re-runs the eval suite (a second
+        # time, redundant with the step above for a real setup — see
+        # the note below) and explicitly fails the whole job with
+        # sys.exit(1) if the pass rate drops below a defined
+        # threshold (80%, matching our first real eval baseline from
+        # Step 9.2). A non-zero exit code from any step fails the
+        # job, which — combined with build-and-push's `needs:
+        # eval-gate` below — means a quality regression physically
+        # cannot reach deployment. This inline Python is intentionally
+        # simple for clarity; a more polished version would have
+        # run_eval.py itself accept a --gate flag and exit
+        # appropriately, called once, rather than running the suite
+        # twice as shown here.
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: eval-gate
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # This condition is what keeps a pull request from ever deploying
+    # anything — build-and-push (and deploy, below) only run on an
+    # actual push to main, not on PR runs. A PR still gets full
+    # lint/test/eval feedback, just never reaches build/deploy.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.CI_SA_EMAIL }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev
+
+      - name: Build and push image
+        run: |
+          docker build -t ${{ env.IMAGE }}:${{ github.sha }} -t ${{ env.IMAGE }}:latest .
+          docker push ${{ env.IMAGE }}:${{ github.sha }}
+          docker push ${{ env.IMAGE }}:latest
+        # Tagging with BOTH the commit SHA and "latest" — :latest for
+        # convenience (what our current deployment.yaml references),
+        # and the SHA-specific tag for real traceability: it lets you
+        # look at what's actually running in the cluster and know
+        # EXACTLY which commit produced it, and roll back to a
+        # specific prior version by tag if ever needed. Using only
+        # ":latest" in production is a known anti-pattern precisely
+        # because it loses this traceability.
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.CI_SA_EMAIL }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: documind-cluster
+          location: ${{ env.REGION }}
+
+      - name: Deploy to GKE
+        run: |
+          kubectl set image deployment/documind-api documind-api=${{ env.IMAGE }}:${{ github.sha }}
+          kubectl rollout status deployment/documind-api --timeout=180s
+        # kubectl set image triggers a ROLLING update — Kubernetes
+        # replaces pods gradually rather than all at once, so traffic
+        # keeps being served throughout the deploy. Pointing at the
+        # SHA-specific tag (not :latest) here is deliberate and
+        # important: it guarantees this deploy runs EXACTLY the image
+        # just built and eval-gated in this same pipeline run, with
+        # zero ambiguity about which image ":latest" might resolve to
+        # if another build happened to run concurrently.
+        #
+        # kubectl rollout status blocks until the rollout actually
+        # succeeds (or the timeout is hit) — turning "kubectl said the
+        # command ran" into "the new pods are genuinely healthy and
+        # serving traffic," using the same livenessProbe/readinessProbe
+        # from deployment.yaml (Step 8.4) that Kubernetes was already
+        # using to judge pod health.

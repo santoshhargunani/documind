@@ -55,3 +55,10 @@ module "bigquery" {
   project_id = var.project_id
   region     = var.region
 }
+
+module "github_ci" {
+  source = "../../modules/github_ci"
+
+  project_id  = var.project_id
+  github_repo = "your-github-username/documind"
+}
