@@ -1,269 +1,413 @@
 """
-db.py
------
-Persists ingested documents and their embedded chunks into Cloud SQL
-(Postgres + pgvector). This is the final step of the ingestion
-pipeline: upload -> parse -> chunk -> embed -> **write to database**.
+db.py  --  Tenant-aware persistence layer (Cloud SQL Postgres + pgvector).
 
-Design notes:
-- Uses pg8000 (pure-Python Postgres driver, chosen back in Step 4.1 to
-  avoid needing a C compiler on Windows).
-- Connects over whatever DB_HOST is configured — a public IP with SSL
-  for local development right now, and later a private IP with no
-  public exposure at all once this code runs inside GKE (same VPC as
-  the database). The connection logic itself doesn't need to change
-  between those two cases, only the .env value does.
-- Every write happens inside an explicit transaction, committed only
-  after both the document row and all its chunk rows succeed — so a
-  failure partway through never leaves a document with only some of
-  its chunks persisted.
+PLACE AT: src/documind/db.py   (REPLACES the existing file)
+
+BIG IDEAS
+  1. Every database call takes a tenant_id. We open a connection as the
+     low-privilege role `documind_app` and tell Postgres which tenant this
+     transaction belongs to with set_config('app.tenant_id', ..., true).
+     Row-Level Security policies (schema.sql) then hide/forbid every row that
+     belongs to anyone else. Even a buggy query cannot cross tenants.
+  2. Ingestion is made safe for duplicate / retried Pub/Sub messages with a
+     "claim" step: a worker atomically claims a document version (with a time
+     lease) before doing expensive work, and finalises it in ONE transaction.
+  3. A document only becomes `ready` in the same transaction that swaps in its
+     new chunks, so queries never see a half-indexed document.
+
+IMPORTANT RULE FOR CALLERS
+  Do all work for one logical step inside ONE `with tenant_connection(...)`
+  block and never call commit() yourself. The tenant setting is
+  transaction-local: it disappears at commit/rollback, which is exactly what
+  prevents a pooled connection from leaking one tenant's identity to another.
+
+BREAKING CHANGE
+  The old get_connection() / insert_document() / insert_chunks() /
+  persist_document() are gone. Any other module that imported them (retriever,
+  MCP server, API, eval) will fail loudly on import until it is made
+  tenant-aware -- that is intentional (a silent un-scoped query would now just
+  return zero rows).
 """
 
-# --- IMPORTS ---
-
+# contextmanager lets us write a `with ...:` helper as a generator function:
+# code before `yield` is setup, code after is guaranteed teardown.
 from contextlib import contextmanager
-# Standard library. Used to build a "context manager" — an object that
-# supports Python's `with` statement, guaranteeing setup/teardown code
-# (opening and closing a database connection, here) always runs, even
-# if an exception occurs partway through. This is the same principle
-# as `with open(file) as f:` automatically closing a file.
 
-from typing import Iterator
-# Standard library typing helper. Used to type-annotate the generator
-# function get_connection() below — it "yields" a connection rather
-# than returning one outright, and Iterator[Connection] is how we
-# describe that to mypy.
+# dataclass = lightweight typed containers for results (no boilerplate __init__).
+from dataclasses import dataclass
 
+# Iterator types the generator in tenant_connection; Literal restricts a string
+# to a fixed set of allowed values (so typos are caught by mypy).
+from typing import Iterator, Literal
+
+# pg8000: pure-Python Postgres driver (no C compiler needed on Windows).
+# `.dbapi` gives the standard DB-API interface: connect(), cursor(), execute().
 import pg8000.dbapi
-# The actual Postgres driver. pg8000.dbapi gives us a DB-API 2.0
-# compliant interface (connect(), cursor(), execute(), etc.) — the
-# same standard interface pattern used by psycopg2, sqlite3, and
-# most other Python database drivers, so this code would look
-# familiar to anyone who's used any of them.
 
+# Structured (key=value / JSON) logging, consistent with the rest of the project.
 import structlog
-# Structured logging, consistent with every other module in this
-# project.
 
+# Our strict tenant-id rule (same one auth.py and the database CHECK use).
+from documind.auth import is_valid_tenant_id
+
+# Typed settings: db_host, db_port, db_name, db_app_user, db_sslmode, ...
 from documind.config import get_settings
-# Our Settings loader — gives us db_host, db_port, db_name, db_user,
-# db_sslmode without hardcoding any of them here.
 
-from documind.config_secrets import get_db_password
-# Fetches the actual database password from Secret Manager at
-# connection time — never stored in code, config files, or logs.
+# Fetches the APP role's password from Secret Manager (cached after first call).
+from documind.config_secrets import get_app_db_password
 
+# The object we persist: a Chunk (text + position) plus its 768-dim embedding.
 from documind.ingestion.embedder import EmbeddedChunk
-# The data model we're persisting — each EmbeddedChunk carries its
-# original Chunk (text, position) plus its 768-dimension embedding
-# vector, produced in Step 4.7.
 
-
-# --- LOGGER SETUP ---
-
+# Module-level logger.
 logger = structlog.get_logger()
 
 
-# --- CONNECTION MANAGEMENT ---
+# --------------------------------------------------------------------------- #
+# Result types and errors
+# --------------------------------------------------------------------------- #
+
+class StaleClaimError(Exception):
+    """Raised when we try to finish/fail a document version that is no longer
+    the current one (a newer upload superseded it, or it was deleted)."""
+
+
+@dataclass(frozen=True)
+class TenantInfo:
+    """The few tenant facts the worker needs."""
+    tenant_id: str
+    status: str                # 'active' or 'suspended'
+    max_concurrent_docs: int   # per-tenant concurrency cap (enforced in a later step)
+
+
+# All the ways a claim attempt can end.
+ClaimOutcome = Literal[
+    "claimed",            # we own this document version now -> go process it
+    "duplicate_ready",    # this exact version is already fully ingested -> nothing to do
+    "stale",              # a NEWER version already exists -> ignore this message
+    "failed_previously",  # this version failed permanently earlier -> don't retry automatically
+    "in_progress",        # another worker holds a live lease -> retry later
+]
+
+
+@dataclass(frozen=True)
+class ClaimResult:
+    """Outcome of claim_document()."""
+    outcome: ClaimOutcome
+    document_id: str | None = None   # set when outcome == "claimed"
+    attempts: int = 0                # how many times this version has been claimed
+    last_error: str | None = None    # previous failure message, if any
+
+
+# --------------------------------------------------------------------------- #
+# Connection management
+# --------------------------------------------------------------------------- #
 
 @contextmanager
-def get_connection() -> Iterator[pg8000.dbapi.Connection]:
+def tenant_connection(tenant_id: str) -> Iterator[pg8000.dbapi.Connection]:
     """
-    Opens a Postgres connection using pg8000, configured from Settings
-    and Secret Manager, and guarantees it's closed afterward.
+    Open a connection as the low-privilege app role, scoped to ONE tenant, and
+    run everything inside ONE transaction.
+
+    Behaviour:
+      * normal exit of the `with` block  -> COMMIT
+      * any exception inside the block   -> ROLLBACK, then re-raise
+      * always                           -> connection is closed
 
     Usage:
-        with get_connection() as conn:
-            ... use conn ...
-    The connection is automatically closed when the `with` block exits,
-    whether it exits normally or via an exception.
+        with tenant_connection("acme") as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT ...")
     """
+    # Defense in depth: refuse malformed tenant ids before they reach the DB.
+    if not is_valid_tenant_id(tenant_id):
+        raise ValueError(f"invalid tenant_id: {tenant_id!r}")
 
     settings = get_settings()
-    # Load cached config: db_host, db_port, db_name, db_user, db_sslmode.
 
-    password = get_db_password()
-    # Fetch the real password from Secret Manager (cached after first
-    # call, per Step 4.4's @lru_cache).
-
+    # Open the TCP connection as documind_app (NOT the admin), so RLS applies.
     conn = pg8000.dbapi.connect(
         host=settings.db_host,
         port=settings.db_port,
         database=settings.db_name,
-        user=settings.db_user,
-        password=password,
+        user=settings.db_app_user,
+        password=get_app_db_password(),
+        # Cloud SQL is configured ENCRYPTED_ONLY, so negotiate TLS when "require".
         ssl_context=True if settings.db_sslmode == "require" else None,
     )
-    # Opens the actual TCP connection to Postgres.
-    #   - ssl_context=True tells pg8000 to negotiate an SSL/TLS
-    #     connection — required right now since our Cloud SQL instance
-    #     is configured with ssl_mode = "ENCRYPTED_ONLY" (Step 4.8,
-    #     Terraform change). ssl_context=None disables SSL, which
-    #     would only be appropriate over a private-IP-only connection
-    #     inside the VPC where GCP's network boundary itself provides
-    #     the security guarantee (still worth using SSL there too in
-    #     a real production system — noted here as a simplification
-    #     for this dev setup, not a recommendation to skip it later).
-
     try:
-        yield conn
-        # Hands the open connection to whatever code is inside the
-        # `with get_connection() as conn:` block. Execution pauses
-        # here until that block finishes.
-    finally:
-        conn.close()
-        # Guaranteed to run once the `with` block exits — whether it
-        # completed normally or raised an exception. This is exactly
-        # the guarantee @contextmanager + try/finally gives us, and
-        # it's what prevents leaked, dangling open connections if
-        # something inside the `with` block fails.
-
-
-# --- WRITE FUNCTIONS ---
-
-def insert_document(gcs_uri: str, original_filename: str, page_count: int) -> str:
-    """
-    Inserts one row into the `documents` table and returns its
-    generated UUID (as a string) — the foreign key that every chunk
-    belonging to this document will reference.
-    """
-
-    with get_connection() as conn:
         cursor = conn.cursor()
-        # A cursor is what actually executes SQL statements and lets
-        # you fetch results, over an open connection. Standard DB-API
-        # pattern — one cursor per unit of work here.
+        # set_config(name, value, is_local):
+        #   is_local = true  -> setting lasts only until the end of this transaction
+        #                       (the equivalent of SET LOCAL, but it accepts a bound
+        #                        parameter, which SET LOCAL does not -> no SQL injection).
+        # The RLS policies read this value via current_setting('app.tenant_id').
+        cursor.execute("SELECT set_config('app.tenant_id', %s, true)", (tenant_id,))
+        cursor.close()
+        # Hand the ready-to-use connection to the caller's `with` block.
+        yield conn
+        # Caller finished without error -> make all of its changes permanent.
+        conn.commit()
+    except Exception:
+        # Something failed -> undo every change made in this transaction.
+        conn.rollback()
+        raise
+    finally:
+        # Always release the connection, success or failure.
+        conn.close()
 
+
+# --------------------------------------------------------------------------- #
+# Tenant lookup
+# --------------------------------------------------------------------------- #
+
+def get_tenant(tenant_id: str) -> TenantInfo | None:
+    """Return the tenant's info, or None if no such tenant exists.
+
+    Works because the `tenant_self_read` policy lets a tenant context read its
+    OWN row only (so this can't be used to list other tenants).
+    """
+    with tenant_connection(tenant_id) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT status, max_concurrent_docs FROM tenants WHERE tenant_id = %s",
+            (tenant_id,),
+        )
+        row = cursor.fetchone()  # None if the tenant row doesn't exist
+    if row is None:
+        return None
+    return TenantInfo(tenant_id=tenant_id, status=row[0], max_concurrent_docs=row[1])
+
+
+# --------------------------------------------------------------------------- #
+# Ingestion lifecycle: claim -> (process elsewhere) -> finalize / fail / release
+# --------------------------------------------------------------------------- #
+
+def claim_document(
+    tenant_id: str,
+    gcs_uri: str,
+    original_filename: str,
+    generation: int,
+    lease_seconds: int,
+) -> ClaimResult:
+    """
+    Atomically try to take ownership of one version (generation) of a document.
+
+    A single INSERT ... ON CONFLICT statement does it, so two workers racing on
+    the same message cannot both win. The UPDATE branch only fires when:
+      * the incoming generation is NEWER than what we have (an overwrite), or
+      * it is the same generation, still 'processing', and the previous
+        worker's lease has EXPIRED (that worker presumably died).
+    Otherwise zero rows come back and we SELECT the row to explain why.
+    """
+    with tenant_connection(tenant_id) as conn:
+        cursor = conn.cursor()
         cursor.execute(
             """
-            INSERT INTO documents (gcs_uri, original_filename, page_count)
-            VALUES (%s, %s, %s)
-            RETURNING id;
+            INSERT INTO documents
+                (tenant_id, gcs_uri, original_filename, generation,
+                 status, attempts, lease_expires_at)
+            VALUES
+                (%s, %s, %s, %s, 'processing', 1, now() + make_interval(secs => %s))
+            ON CONFLICT (tenant_id, gcs_uri) DO UPDATE SET
+                original_filename = EXCLUDED.original_filename,
+                generation        = EXCLUDED.generation,
+                status            = 'processing',
+                -- same version re-claimed -> count another attempt; new version -> start at 1
+                attempts          = CASE WHEN documents.generation = EXCLUDED.generation
+                                         THEN documents.attempts + 1 ELSE 1 END,
+                lease_expires_at  = EXCLUDED.lease_expires_at,
+                updated_at        = now()
+            WHERE documents.generation < EXCLUDED.generation
+               OR (documents.generation = EXCLUDED.generation
+                   AND documents.status = 'processing'
+                   AND (documents.lease_expires_at IS NULL
+                        OR documents.lease_expires_at < now()))
+            RETURNING id, attempts, last_error;
             """,
-            (gcs_uri, original_filename, page_count),
+            (tenant_id, gcs_uri, original_filename, generation, float(lease_seconds)),
         )
-        # Parameterized query: the %s placeholders are filled in by
-        # the driver from the tuple (gcs_uri, original_filename,
-        # page_count), NOT via Python string formatting/f-strings.
-        # This is a critical security practice — it prevents SQL
-        # injection, since the driver sends the values separately
-        # from the SQL text rather than concatenating user-controlled
-        # strings directly into the query. Never build SQL with
-        # f-strings when values come from outside the code.
-        #
-        # RETURNING id asks Postgres to hand back the auto-generated
-        # UUID from this INSERT immediately, so we don't need a
-        # separate SELECT to find out what ID was just created.
+        row = cursor.fetchone()
 
-        document_id = cursor.fetchone()[0]
-        # fetchone() returns the next row of results as a tuple —
-        # here, just one row with one column (the id), so [0] pulls
-        # that single value out.
+        if row is not None:
+            # We won the claim (new row inserted, or stale/expired row taken over).
+            return ClaimResult(
+                outcome="claimed",
+                document_id=str(row[0]),
+                attempts=row[1],
+                last_error=row[2],
+            )
 
-        conn.commit()
-        # Explicitly commits the transaction, making this INSERT
-        # permanent. pg8000 (like most DB-API drivers) does not
-        # auto-commit by default — without this line, the insert
-        # would be rolled back when the connection closes.
+        # We did not win. Look at the existing row to classify why.
+        cursor.execute(
+            "SELECT generation, status FROM documents WHERE tenant_id = %s AND gcs_uri = %s",
+            (tenant_id, gcs_uri),
+        )
+        existing = cursor.fetchone()
 
-        logger.info("document_inserted", document_id=str(document_id), gcs_uri=gcs_uri)
+    if existing is None:
+        # Row vanished between our INSERT and SELECT (concurrent delete). Ask for a retry.
+        return ClaimResult(outcome="in_progress")
 
-        return str(document_id)
-        # UUIDs come back from pg8000 as Python UUID objects; we
-        # convert to str for a simpler, JSON-serializable return type
-        # that's easy to pass around and log.
+    existing_generation, existing_status = existing
+    if existing_generation > generation:
+        return ClaimResult(outcome="stale")              # a newer upload already exists
+    if existing_status == "ready":
+        return ClaimResult(outcome="duplicate_ready")    # this version is already indexed
+    if existing_status == "failed":
+        return ClaimResult(outcome="failed_previously")  # failed permanently; needs manual replay
+    return ClaimResult(outcome="in_progress")            # another worker is on it right now
 
 
-def insert_chunks(document_id: str, embedded_chunks: list[EmbeddedChunk]) -> int:
+def finalize_document(
+    tenant_id: str,
+    document_id: str,
+    generation: int,
+    page_count: int | None,
+    content_hash: str | None,
+    embedded_chunks: list[EmbeddedChunk],
+) -> int:
     """
-    Inserts all chunks for a given document in a single transaction.
-    Returns the number of chunks inserted.
+    Mark the document 'ready' and swap in its new chunks, ALL IN ONE TRANSACTION.
 
-    All-or-nothing behavior: if any chunk fails to insert, the whole
-    batch is rolled back — we never want a document left with only
-    some of its chunks persisted, since that would silently produce
-    incomplete (and misleading) retrieval results later.
+    Because it is one transaction, readers see either the complete OLD version
+    or the complete NEW version -- never a mixture or a half-written document.
+    Raises StaleClaimError (changing nothing) if our claim is no longer current.
+    Returns the number of chunks written.
     """
-
-    with get_connection() as conn:
+    with tenant_connection(tenant_id) as conn:
         cursor = conn.cursor()
 
-        for item in embedded_chunks:
-            embedding_str = "[" + ",".join(str(x) for x in item.embedding) + "]"
-            # pg8000 doesn't have native support for pgvector's custom
-            # `vector` type — as far as the driver is concerned, it's
-            # just sending a value. pgvector accepts a specific text
-            # format for vectors: "[0.123,0.456,...]" — a
-            # comma-separated list inside square brackets, as a
-            # string. This line builds exactly that string from our
-            # Python list[float]. The SQL query below then explicitly
-            # casts this string to the `vector` type with `::vector`.
+        # Step 1: flip to 'ready', but ONLY if this exact generation is still
+        # ours and still 'processing'. This also row-locks the document so no
+        # other worker can modify it until we commit.
+        cursor.execute(
+            """
+            UPDATE documents
+               SET status = 'ready',
+                   page_count = %s,
+                   content_hash = %s,
+                   lease_expires_at = NULL,
+                   last_error = NULL,
+                   ingested_at = now(),
+                   updated_at = now()
+             WHERE id = %s::uuid AND generation = %s AND status = 'processing'
+            RETURNING id;
+            """,
+            (page_count, content_hash, document_id, generation),
+        )
+        if cursor.fetchone() is None:
+            # Nothing updated -> a newer version or a delete superseded our claim.
+            raise StaleClaimError(f"claim no longer current for document {document_id}")
 
-            cursor.execute(
-                """
-                INSERT INTO chunks
-                    (document_id, chunk_index, char_start, char_end, text, embedding)
-                VALUES
-                    (%s, %s, %s, %s, %s, %s::vector);
-                """,
+        # Step 2: remove the chunks of any previous version of this document.
+        cursor.execute(
+            "DELETE FROM chunks WHERE tenant_id = %s AND document_id = %s::uuid",
+            (tenant_id, document_id),
+        )
+
+        # Step 3: build one parameter tuple per chunk.
+        rows = []
+        for item in embedded_chunks:
+            # pg8000 has no native pgvector type; pgvector accepts the text form
+            # "[0.1,0.2,...]" and we cast it with ::vector in the SQL below.
+            embedding_str = "[" + ",".join(str(x) for x in item.embedding) + "]"
+            rows.append(
                 (
+                    tenant_id,
                     document_id,
                     item.chunk.chunk_index,
                     item.chunk.char_start,
                     item.chunk.char_end,
                     item.chunk.text,
                     embedding_str,
-                ),
+                )
             )
-            # Same parameterized-query pattern as insert_document.
-            # %s::vector — the %s placeholder gets filled with our
-            # embedding_str, and ::vector casts that string into
-            # pgvector's native vector type at insert time. This is
-            # the one place in this whole file where pgvector-specific
-            # syntax shows up; everywhere else this is completely
-            # ordinary SQL.
 
-        conn.commit()
-        # Commits all inserts from the loop above as ONE transaction —
-        # this is what gives us the all-or-nothing guarantee described
-        # in the docstring. If any single cursor.execute() call above
-        # raised an exception, we'd never reach this commit() line,
-        # and none of the inserts in this batch would be persisted
-        # (pg8000 rolls back automatically when the connection closes
-        # without a commit, or you could add an explicit except block
-        # with conn.rollback() for clearer intent — worth adding once
-        # this moves toward production-hardening in a later step).
-
-        logger.info(
-            "chunks_inserted",
-            document_id=document_id,
-            chunk_count=len(embedded_chunks),
+        # Step 4: insert all new chunks. Parameterised -> safe from SQL injection.
+        cursor.executemany(
+            """
+            INSERT INTO chunks
+                (tenant_id, document_id, chunk_index, char_start, char_end, text, embedding)
+            VALUES
+                (%s, %s::uuid, %s, %s, %s, %s, %s::vector);
+            """,
+            rows,
         )
-
-        return len(embedded_chunks)
-
-
-def persist_document(
-    gcs_uri: str,
-    original_filename: str,
-    page_count: int,
-    embedded_chunks: list[EmbeddedChunk],
-) -> str:
-    """
-    Convenience wrapper: inserts the document row, then all its
-    chunks, in sequence. This is the single function the ingestion
-    pipeline script will call — callers don't need to know about
-    insert_document/insert_chunks individually.
-    """
-
-    document_id = insert_document(gcs_uri, original_filename, page_count)
-    insert_chunks(document_id, embedded_chunks)
+        # No commit() here: tenant_connection commits when this block exits cleanly.
 
     logger.info(
-        "document_persisted",
+        "document_finalized",
+        tenant_id=tenant_id,
         document_id=document_id,
-        gcs_uri=gcs_uri,
-        chunk_count=len(embedded_chunks),
+        chunk_count=len(rows),
     )
+    return len(rows)
 
-    return document_id
+
+def mark_failed(tenant_id: str, document_id: str, generation: int, error: str) -> None:
+    """Record a PERMANENT failure (e.g. corrupt PDF). Not retried automatically."""
+    with tenant_connection(tenant_id) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE documents
+               SET status = 'failed',
+                   last_error = %s,
+                   lease_expires_at = NULL,
+                   updated_at = now()
+             WHERE id = %s::uuid AND generation = %s AND status = 'processing';
+            """,
+            (error[:2000], document_id, generation),  # cap length so a huge trace can't bloat the row
+        )
+    logger.warning("document_failed", tenant_id=tenant_id, document_id=document_id, error=error[:500])
+
+
+def release_claim(tenant_id: str, document_id: str, generation: int, error: str) -> None:
+    """Give up our claim after a TRANSIENT error so the redelivered message can
+    re-claim immediately (by expiring the lease now) instead of waiting it out."""
+    with tenant_connection(tenant_id) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE documents
+               SET last_error = %s,
+                   lease_expires_at = now(),
+                   updated_at = now()
+             WHERE id = %s::uuid AND generation = %s AND status = 'processing';
+            """,
+            (error[:2000], document_id, generation),
+        )
+    logger.warning("claim_released", tenant_id=tenant_id, document_id=document_id, error=error[:500])
+
+
+def delete_document(tenant_id: str, gcs_uri: str) -> bool:
+    """Remove a document (its chunks go too, via ON DELETE CASCADE).
+    Used when the object is deleted from the bucket. Returns True if a row existed."""
+    with tenant_connection(tenant_id) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM documents WHERE tenant_id = %s AND gcs_uri = %s",
+            (tenant_id, gcs_uri),
+        )
+        deleted = cursor.rowcount > 0  # rowcount = number of rows the DELETE removed
+    if deleted:
+        logger.info("document_deleted", tenant_id=tenant_id, gcs_uri=gcs_uri)
+    return deleted
+
+
+# --------------------------------------------------------------------------- #
+# Small helper used by tests / demos
+# --------------------------------------------------------------------------- #
+
+def count_chunks(tenant_id: str) -> int:
+    """How many chunks does this tenant's context see?
+
+    NOTE there is deliberately NO `WHERE tenant_id = ...` here: the count is
+    filtered purely by Row-Level Security, so it demonstrates that the database
+    itself enforces the wall.
+    """
+    with tenant_connection(tenant_id) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT count(*) FROM chunks")
+        return int(cursor.fetchone()[0])
