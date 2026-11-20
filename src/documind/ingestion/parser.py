@@ -12,7 +12,7 @@ logger = structlog.get_logger()
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=30),
 )
-def parse_document(gcs_uri: str, mime_type: str = "application/pdf") -> str:
+def parse_document(gcs_uri: str, mime_type: str = "application/pdf") -> tuple[str, int]:
     settings = get_settings()
 
     client_options = ClientOptions(

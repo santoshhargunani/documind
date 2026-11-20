@@ -1,0 +1,22 @@
+# Dockerfile.worker
+# -----------------
+# Container for the event-driven ingestion worker (src/documind/worker/app.py),
+# deployed to Cloud Run. Pub/Sub push -> POST /pubsub/push -> ingest_object().
+# Build: docker build -f Dockerfile.worker -t <repo>/documind-worker:<tag> .
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY pyproject.toml ./
+COPY src/ ./src/
+RUN pip install --no-cache-dir .
+
+RUN useradd --create-home --shell /bin/bash appuser
+USER appuser
+
+# Cloud Run sends traffic to $PORT (8080 by default).
+ENV PORT=8080
+EXPOSE 8080
+
+CMD ["sh", "-c", "uvicorn documind.worker.app:app --host 0.0.0.0 --port ${PORT}"]

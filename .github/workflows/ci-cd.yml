@@ -34,6 +34,7 @@ env:
   WORKLOAD_IDENTITY_PROVIDER: projects/316104585600/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
   CI_SA_EMAIL: documind-ci@project-672c834c-460a-4d65-a9b.iam.gserviceaccount.com
   IMAGE: us-central1-docker.pkg.dev/project-672c834c-460a-4d65-a9b/documind/documind-api
+  WORKER_IMAGE: us-central1-docker.pkg.dev/project-672c834c-460a-4d65-a9b/documind/documind-worker
   # Centralized here so every job below references the same values —
   # avoids the same class of "value drifted between two places" bug
   # this project has hit repeatedly with manually-updated .env files.
@@ -184,6 +185,11 @@ jobs:
           docker build -t ${{ env.IMAGE }}:${{ github.sha }} -t ${{ env.IMAGE }}:latest .
           docker push ${{ env.IMAGE }}:${{ github.sha }}
           docker push ${{ env.IMAGE }}:latest
+
+      - name: Build and push ingestion worker image
+        run: |
+          docker build -f Dockerfile.worker -t ${{ env.WORKER_IMAGE }}:${{ github.sha }} .
+          docker push ${{ env.WORKER_IMAGE }}:${{ github.sha }}
         # Tagging with BOTH the commit SHA and "latest" — :latest for
         # convenience (what our current deployment.yaml references),
         # and the SHA-specific tag for real traceability: it lets you
@@ -231,3 +237,12 @@ jobs:
         # serving traffic," using the same livenessProbe/readinessProbe
         # from deployment.yaml (Step 8.4) that Kubernetes was already
         # using to judge pod health.
+
+      - name: Deploy ingestion worker to Cloud Run
+        run: |
+          gcloud run deploy documind-ingest-worker \
+            --image ${{ env.WORKER_IMAGE }}:${{ github.sha }} \
+            --region ${{ env.REGION }} \
+            --project ${{ env.PROJECT_ID }}
+        # Terraform creates the service (and ignores image changes);
+        # CI owns which image revision runs.

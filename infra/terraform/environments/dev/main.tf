@@ -24,6 +24,34 @@ module "ingestion" {
   raw_docs_bucket_name = "${var.project_id}-documind-raw-docs"
 }
 
+module "ingestion_worker" {
+  source = "../../modules/ingestion_worker"
+
+  project_id     = var.project_id
+  project_number = "316104585600"
+  region         = var.region
+
+  raw_docs_bucket_name      = module.ingestion.bucket_name
+  network_name              = module.vpc.network_name
+  subnet_name               = module.vpc.subnet_name
+  app_db_password_secret_id = "documind-postgres-app-password"
+
+  env = {
+    GCP_PROJECT_ID              = var.project_id
+    GCP_REGION                  = var.region
+    RAW_DOCS_BUCKET             = module.ingestion.bucket_name
+    DOCAI_LOCATION              = "us"
+    DOCAI_PROCESSOR_ID          = element(split("/", module.ingestion.processor_id), length(split("/", module.ingestion.processor_id)) - 1)
+    DB_INSTANCE_CONNECTION_NAME = module.cloudsql.instance_connection_name
+    DB_NAME                     = module.cloudsql.db_name
+    DB_HOST                     = module.cloudsql.private_ip_address
+    DB_PASSWORD_SECRET_ID       = module.cloudsql.secret_id
+    DB_SSLMODE                  = "require"
+  }
+
+  depends_on = [module.ingestion, module.cloudsql]
+}
+
 module "artifact_registry" {
   source = "../../modules/artifact_registry"
 

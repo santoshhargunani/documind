@@ -53,3 +53,15 @@ output "workload_identity_provider" {
 output "ci_sa_email" {
   value = module.github_ci.ci_sa_email
 }
+
+output "ingest_worker_url" {
+  value = module.ingestion_worker.worker_url
+}
+
+output "ingest_worker_service_name" {
+  value = module.ingestion_worker.worker_service_name
+}
+
+output "ingest_dlq_subscription" {
+  value = module.ingestion_worker.dead_letter_subscription
+}
