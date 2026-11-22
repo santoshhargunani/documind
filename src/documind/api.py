@@ -15,6 +15,7 @@ Run with:  uvicorn documind.api:app --reload
 
 # --- IMPORTS ---
 
+from typing import Annotated
 import structlog
 # Structured logging, consistent with every other module in this
 # project. Unlike mcp_server.py, we do NOT need to redirect this to
@@ -23,7 +24,7 @@ import structlog
 # FastAPI/uvicorn communicates over HTTP, not stdio, so stdout is
 # safe for logging in this file.
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 # FastAPI: the web framework itself — the `app` object below is an
 # instance of this.
 # HTTPException: FastAPI's mechanism for returning a proper HTTP error
@@ -48,9 +49,10 @@ from starlette.concurrency import run_in_threadpool
 # package even though we're using it from a FastAPI app.
 
 from documind.agents.graph import build_graph
+from documind.auth import TenantContext, get_tenant_context
+
 # The compiled LangGraph StateGraph from Step 5.6 — the exact same
 # object mcp_server.py uses. One graph, two thin interfaces.
-
 from documind.tracing import configure_tracing
 
 # --- LOGGER SETUP ---
@@ -129,7 +131,10 @@ def health_check() -> dict:
 # --- MAIN ENDPOINT ---
 
 @app.post("/ask", response_model=AskResponse)
-async def ask_question(request: AskRequest) -> AskResponse:
+async def ask_question(
+    request: AskRequest,
+    tenant: Annotated[TenantContext, Depends(get_tenant_context)],
+) -> AskResponse:
     """
     Accepts a question, runs it through the full DocuMind agent graph
     (router -> retriever -> synthesis -> critic, including any retry
@@ -141,7 +146,12 @@ async def ask_question(request: AskRequest) -> AskResponse:
     try:
         result = await run_in_threadpool(
             _graph.invoke,
-            {"question": request.question, "retry_count": 0, "retrieved_chunks": []},
+            {
+                "question": request.question,
+                "tenant_id": tenant.tenant_id,
+                "retry_count": 0,
+                "retrieved_chunks": [],
+            },
         )
         # This is the actual fix for the async/sync mismatch discussed
         # in chat: run_in_threadpool(_graph.invoke, {...}) schedules

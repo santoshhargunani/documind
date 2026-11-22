@@ -6,8 +6,13 @@
 # =============================================================================
 
 locals {
-  gcs_service_agent    = "serviceAccount:service-${var.project_number}@gs-project-accounts.iam.gserviceaccount.com"
+  gcs_service_agent    = "serviceAccount:${data.google_storage_project_service_account.gcs.email_address}"
   pubsub_service_agent = "serviceAccount:service-${var.project_number}@gcp-sa-pubsub.iam.gserviceaccount.com"
+}
+
+# Looking this up also provisions the GCS service agent in fresh projects.
+data "google_storage_project_service_account" "gcs" {
+  project = var.project_id
 }
 
 resource "google_project_service" "apis" {

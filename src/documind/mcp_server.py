@@ -33,6 +33,7 @@ from mcp.server.fastmcp import FastMCP
 # handling yourself.
 
 from documind.agents.graph import build_graph
+from documind.auth import verify_token
 # The compiled LangGraph StateGraph from Step 5.6 — router, retriever,
 # synthesis, and critic all wired together as one invokable unit.
 # This MCP server doesn't reimplement any of that logic; it's a thin
@@ -69,7 +70,7 @@ _graph = build_graph()
 # --- THE MCP TOOL ---
 
 @mcp.tool()
-def search_knowledge_base(question: str) -> str:
+def search_knowledge_base(question: str, token: str) -> str:
     """
     Answers a question using DocuMind's enterprise knowledge base.
 
@@ -80,6 +81,7 @@ def search_knowledge_base(question: str) -> str:
 
     Args:
         question: The question to answer, in natural language.
+        token: A valid DocuMind JWT for the caller's tenant.
 
     Returns:
         A grounded answer, or an explanation if the question is too
@@ -99,8 +101,14 @@ def search_knowledge_base(question: str) -> str:
 
     logger.info("mcp_tool_invoked", tool="search_knowledge_base", question=question)
 
+    identity = verify_token(token)
     result = _graph.invoke(
-        {"question": question, "retry_count": 0, "retrieved_chunks": []}
+        {
+            "question": question,
+            "tenant_id": identity.tenant_id,
+            "retry_count": 0,
+            "retrieved_chunks": [],
+        }
     )
     # Invoking the SAME compiled graph tested end-to-end in
     # scripts/test_graph.py. Every piece of logic — routing,

@@ -36,10 +36,8 @@ from documind.agents.state import AgentState, RetrievedChunk
 # the Pydantic model we build each search result into.
 
 from documind.config import get_settings
-from documind.db import get_connection
-# Reusing the exact same connection function from db.py (Step 4.8) —
-# one place that knows how to connect to Cloud SQL, used by both the
-# ingestion write path and this retrieval read path.
+from documind.db import tenant_connection
+# The tenant-scoped connection ensures retrieval is filtered by Postgres RLS.
 
 
 # --- LOGGER SETUP ---
@@ -112,7 +110,9 @@ def _embed_query(question: str) -> list[float]:
 
 # --- SIMILARITY SEARCH HELPER ---
 
-def _search_chunks(query_embedding: list[float], top_k: int) -> list[RetrievedChunk]:
+def _search_chunks(
+    query_embedding: list[float], top_k: int, tenant_id: str
+) -> list[RetrievedChunk]:
     """
     Runs the actual pgvector cosine-similarity search — the same
     query pattern proved out in scripts/test_retrieval.py (Step 4),
@@ -125,7 +125,7 @@ def _search_chunks(query_embedding: list[float], top_k: int) -> list[RetrievedCh
     # test_retrieval.py script) — pg8000 needs the vector as a
     # bracketed, comma-separated string, cast via ::vector in SQL.
 
-    with get_connection() as conn:
+    with tenant_connection(tenant_id) as conn:
         cursor = conn.cursor()
 
         cursor.execute(
@@ -178,7 +178,11 @@ def retrieve_chunks(state: AgentState) -> dict:
     question = state["question"]
 
     query_embedding = _embed_query(question)
-    chunks = _search_chunks(query_embedding, top_k=_TOP_K)
+    chunks = _search_chunks(
+        query_embedding,
+        top_k=_TOP_K,
+        tenant_id=state["tenant_id"],
+    )
 
     logger.info(
         "chunks_retrieved",

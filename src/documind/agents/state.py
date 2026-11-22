@@ -31,7 +31,6 @@ from typing import Annotated, Literal, TypedDict
 #   - Annotated: lets us attach extra metadata to a type hint. We use
 #     it below to tell LangGraph HOW to merge updates to a specific
 #     field (see the reducer explanation on retrieved_chunks).
-
 from operator import add
 # Standard library. We use the plain `add` function as a "reducer" —
 # see the detailed explanation below at retrieved_chunks. In short:
@@ -84,6 +83,9 @@ class AgentState(TypedDict):
     # The user's original question, set once at the start of a run
     # and never modified afterward. Every downstream node can refer
     # back to this original wording, even after several graph steps.
+
+    tenant_id: str
+    # Derived from verified caller identity; required to scope database access.
 
     route: Literal["retrieve", "clarify", "reject"] | None
     # Set by the router agent (Step 5.2) — its decision about how to
