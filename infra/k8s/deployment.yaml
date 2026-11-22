@@ -43,7 +43,7 @@ spec:
 
       containers:
         - name: documind-api
-          image: us-central1-docker.pkg.dev/project-672c834c-460a-4d65-a9b/documind/documind-api:latest
+          image: us-central1-docker.pkg.dev/project-672c834c-460a-4d65-a9b/documind/documind-api:manual-20261122-1412
           # The exact image we pushed to Artifact Registry in Step 8.2.
           # GKE pulls from here directly — no local image reuse, this
           # is a genuinely separate pull over the network, which is
@@ -60,6 +60,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: documind-config
+            - secretRef:
+                name: documind-auth
           # Bulk-injects every key from the ConfigMap as environment
           # variables — equivalent in spirit to our local --env-file
           # .env flag for docker run, just sourced from a Kubernetes

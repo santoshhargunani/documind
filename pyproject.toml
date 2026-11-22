@@ -15,6 +15,7 @@ dependencies = [
     "google-cloud-documentai>=2.29.0",
     "google-cloud-aiplatform>=1.70.0",
     "google-cloud-secret-manager>=2.20.0",
+    "PyJWT>=2.8.0",
     "pg8000>=1.31.0",
     "pydantic>=2.9.0",
     "pydantic-settings>=2.5.0",
