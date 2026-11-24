@@ -68,7 +68,7 @@ from documind.db import (
 # Existing pipeline steps (unchanged): chunk text, embed chunks, parse via Document AI.
 from documind.ingestion.chunker import chunk_text
 from documind.ingestion.embedder import embed_chunks
-from documind.ingestion.parser import parse_document
+from documind.ingestion.parser import count_pdf_pages, parse_document
 
 logger = structlog.get_logger()
 
@@ -233,7 +233,9 @@ def ingest_object(bucket_name: str, object_name: str) -> IngestOutcome:
     try:
         _validate_pdf(blob)
 
-        text, page_count = parse_document(gcs_uri)       # Document AI OCR/parse
+        with blob.open("rb") as pdf_file:
+            page_count = count_pdf_pages(pdf_file)
+        text, page_count = parse_document(gcs_uri, page_count=page_count)
         if not text.strip():
             raise PermanentIngestError("no extractable text")
 

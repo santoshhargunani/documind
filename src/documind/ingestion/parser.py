@@ -1,12 +1,29 @@
+from typing import BinaryIO
+
 import structlog
 from google.api_core import exceptions as gexc
 from google.api_core.client_options import ClientOptions
 from google.cloud import documentai
+from pypdf import PdfReader
+from pypdf.errors import PdfReadError
 from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
 from documind.config import get_settings
 
 logger = structlog.get_logger()
+
+_PAGE_BATCH_SIZE = 10
+
+
+def count_pdf_pages(pdf_file: BinaryIO) -> int:
+    try:
+        page_count = len(PdfReader(pdf_file).pages)
+    except PdfReadError as exc:
+        raise gexc.InvalidArgument(f"Unable to read PDF pages: {exc}") from exc
+
+    if page_count < 1:
+        raise gexc.InvalidArgument("PDF contains no pages")
+    return page_count
 
 
 @retry(
@@ -15,7 +32,9 @@ logger = structlog.get_logger()
     wait=wait_exponential(multiplier=2, min=2, max=30),
     reraise=True,
 )
-def parse_document(gcs_uri: str, mime_type: str = "application/pdf") -> tuple[str, int]:
+def parse_document(
+    gcs_uri: str, page_count: int, mime_type: str = "application/pdf"
+) -> tuple[str, int]:
     settings = get_settings()
 
     client_options = ClientOptions(
@@ -31,22 +50,61 @@ def parse_document(gcs_uri: str, mime_type: str = "application/pdf") -> tuple[st
 
     gcs_document = documentai.GcsDocument(gcs_uri=gcs_uri, mime_type=mime_type)
 
-    request = documentai.ProcessRequest(
-        name=processor_name,
-        gcs_document=gcs_document,
-        imageless_mode=True,
+    if page_count < 1:
+        raise gexc.InvalidArgument("PDF contains no pages")
+
+    text_parts: list[str] = []
+    processed_page_count = 0
+    logger.info(
+        "parsing_document",
+        gcs_uri=gcs_uri,
+        processor=processor_name,
+        page_count=page_count,
+        page_batch_size=_PAGE_BATCH_SIZE,
     )
 
-    logger.info("parsing_document", gcs_uri=gcs_uri, processor=processor_name)
+    for first_page in range(1, page_count + 1, _PAGE_BATCH_SIZE):
+        page_numbers = list(
+            range(first_page, min(first_page + _PAGE_BATCH_SIZE, page_count + 1))
+        )
+        request = documentai.ProcessRequest(
+            name=processor_name,
+            gcs_document=gcs_document,
+            process_options=documentai.ProcessOptions(
+                individual_page_selector=documentai.ProcessOptions.IndividualPageSelector(
+                    pages=page_numbers
+                )
+            ),
+            imageless_mode=True,
+        )
 
-    result = client.process_document(request=request)
-    extracted_text = result.document.text
+        result = client.process_document(request=request)
+        batch_page_count = len(result.document.pages)
+        if batch_page_count != len(page_numbers):
+            raise gexc.InvalidArgument(
+                f"Document AI returned {batch_page_count} pages for requested "
+                f"pages {first_page}-{page_numbers[-1]}"
+            )
+
+        if result.document.text:
+            text_parts.append(result.document.text)
+        processed_page_count += batch_page_count
+
+        logger.info(
+            "document_page_batch_parsed",
+            gcs_uri=gcs_uri,
+            page_start=first_page,
+            page_end=page_numbers[-1],
+            page_count=batch_page_count,
+        )
+
+    extracted_text = "\n".join(text_parts)
 
     logger.info(
         "parse_complete",
         gcs_uri=gcs_uri,
         text_length=len(extracted_text),
-        page_count=len(result.document.pages),
+        page_count=processed_page_count,
     )
 
-    return extracted_text, len(result.document.pages)
+    return extracted_text, processed_page_count
