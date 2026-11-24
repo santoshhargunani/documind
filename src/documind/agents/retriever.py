@@ -47,7 +47,7 @@ logger = structlog.get_logger()
 
 # --- CONSTANTS ---
 
-_TOP_K = 3
+_TOP_K = 10
 # How many chunks to retrieve per question. Same "top-k retrieval"
 # concept discussed when we tested similarity search manually in
 # Step 4 — kept as a named constant here (rather than a magic number
