@@ -1,7 +1,8 @@
 import structlog
+from google.api_core import exceptions as gexc
 from google.api_core.client_options import ClientOptions
 from google.cloud import documentai
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
 from documind.config import get_settings
 
@@ -9,8 +10,10 @@ logger = structlog.get_logger()
 
 
 @retry(
+    retry=retry_if_not_exception_type(gexc.InvalidArgument),
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=30),
+    reraise=True,
 )
 def parse_document(gcs_uri: str, mime_type: str = "application/pdf") -> tuple[str, int]:
     settings = get_settings()
@@ -31,6 +34,7 @@ def parse_document(gcs_uri: str, mime_type: str = "application/pdf") -> tuple[st
     request = documentai.ProcessRequest(
         name=processor_name,
         gcs_document=gcs_document,
+        imageless_mode=True,
     )
 
     logger.info("parsing_document", gcs_uri=gcs_uri, processor=processor_name)
