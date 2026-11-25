@@ -32,6 +32,7 @@ module "ingestion_worker" {
   region         = var.region
 
   raw_docs_bucket_name      = module.ingestion.bucket_name
+  image                     = "${module.artifact_registry.repository_url}/documind-worker:latest"
   network_name              = module.vpc.network_name
   subnet_name               = module.vpc.subnet_name
   app_db_password_secret_id = "documind-postgres-app-password"

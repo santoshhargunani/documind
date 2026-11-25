@@ -11,9 +11,9 @@ BIG IDEAS
      belongs to anyone else. Even a buggy query cannot cross tenants.
   2. Ingestion is made safe for duplicate / retried Pub/Sub messages with a
      "claim" step: a worker atomically claims a document version (with a time
-     lease) before doing expensive work, and finalises it in ONE transaction.
-  3. A document only becomes `ready` in the same transaction that swaps in its
-     new chunks, so queries never see a half-indexed document.
+     lease) before doing expensive work, then commits chunks in small batches.
+  3. A document only becomes `ready` after every chunk is committed. Retrieval
+     filters out partial chunks belonging to processing or failed documents.
 
 IMPORTANT RULE FOR CALLERS
   Do all work for one logical step inside ONE `with tenant_connection(...)`
@@ -180,7 +180,7 @@ def get_tenant(tenant_id: str) -> TenantInfo | None:
 
 
 # --------------------------------------------------------------------------- #
-# Ingestion lifecycle: claim -> (process elsewhere) -> finalize / fail / release
+# Ingestion lifecycle: claim -> persist batches -> finalize / fail / release
 # --------------------------------------------------------------------------- #
 
 def claim_document(
@@ -259,28 +259,141 @@ def claim_document(
     return ClaimResult(outcome="in_progress")            # another worker is on it right now
 
 
+def _lock_processing_document(
+    cursor: pg8000.dbapi.Cursor,
+    tenant_id: str,
+    document_id: str,
+    generation: int,
+) -> None:
+    cursor.execute(
+        """
+        SELECT id FROM documents
+        WHERE tenant_id = %s AND id = %s::uuid
+          AND generation = %s AND status = 'processing'
+        FOR UPDATE;
+        """,
+        (tenant_id, document_id, generation),
+    )
+    if cursor.fetchone() is None:
+        raise StaleClaimError(f"claim no longer current for document {document_id}")
+
+
+def reset_document_chunks(tenant_id: str, document_id: str, generation: int) -> None:
+    """Clear prior-version or stale partial chunks after a fresh claim."""
+    with tenant_connection(tenant_id) as conn:
+        cursor = conn.cursor()
+        _lock_processing_document(cursor, tenant_id, document_id, generation)
+        cursor.execute(
+            "DELETE FROM chunks WHERE tenant_id = %s AND document_id = %s::uuid",
+            (tenant_id, document_id),
+        )
+
+
+def get_document_chunk_texts(
+    tenant_id: str, document_id: str, generation: int
+) -> dict[int, str]:
+    """Return already-persisted chunks for a claimed generation."""
+    with tenant_connection(tenant_id) as conn:
+        cursor = conn.cursor()
+        _lock_processing_document(cursor, tenant_id, document_id, generation)
+        cursor.execute(
+            """
+            SELECT chunk_index, text FROM chunks
+            WHERE tenant_id = %s AND document_id = %s::uuid
+            ORDER BY chunk_index;
+            """,
+            (tenant_id, document_id),
+        )
+        return {int(row[0]): str(row[1]) for row in cursor.fetchall()}
+
+
+def persist_chunk_batch(
+    tenant_id: str,
+    document_id: str,
+    generation: int,
+    embedded_chunks: list[EmbeddedChunk],
+) -> int:
+    """Persist one idempotent batch while the document remains processing."""
+    if not embedded_chunks:
+        return 0
+
+    with tenant_connection(tenant_id) as conn:
+        cursor = conn.cursor()
+        _lock_processing_document(cursor, tenant_id, document_id, generation)
+
+        for item in embedded_chunks:
+            cursor.execute(
+                """
+                DELETE FROM chunks
+                WHERE tenant_id = %s AND document_id = %s::uuid AND chunk_index = %s;
+                """,
+                (tenant_id, document_id, item.chunk.chunk_index),
+            )
+
+        rows = []
+        for item in embedded_chunks:
+            embedding_str = "[" + ",".join(str(value) for value in item.embedding) + "]"
+            rows.append(
+                (
+                    tenant_id,
+                    document_id,
+                    item.chunk.chunk_index,
+                    item.chunk.char_start,
+                    item.chunk.char_end,
+                    item.chunk.text,
+                    embedding_str,
+                )
+            )
+
+        cursor.executemany(
+            """
+            INSERT INTO chunks
+                (tenant_id, document_id, chunk_index, char_start, char_end, text, embedding)
+            VALUES
+                (%s, %s::uuid, %s, %s, %s, %s, %s::vector);
+            """,
+            rows,
+        )
+
+    logger.info(
+        "chunk_batch_persisted",
+        tenant_id=tenant_id,
+        document_id=document_id,
+        chunk_count=len(rows),
+    )
+    return len(rows)
+
+
 def finalize_document(
     tenant_id: str,
     document_id: str,
     generation: int,
     page_count: int | None,
     content_hash: str | None,
-    embedded_chunks: list[EmbeddedChunk],
+    expected_chunk_count: int,
 ) -> int:
     """
-    Mark the document 'ready' and swap in its new chunks, ALL IN ONE TRANSACTION.
-
-    Because it is one transaction, readers see either the complete OLD version
-    or the complete NEW version -- never a mixture or a half-written document.
-    Raises StaleClaimError (changing nothing) if our claim is no longer current.
-    Returns the number of chunks written.
+    Mark the document ready only after all expected chunks have been committed.
+    Raises if the claim is stale or the stored chunk set is incomplete.
     """
     with tenant_connection(tenant_id) as conn:
         cursor = conn.cursor()
+        _lock_processing_document(cursor, tenant_id, document_id, generation)
 
-        # Step 1: flip to 'ready', but ONLY if this exact generation is still
-        # ours and still 'processing'. This also row-locks the document so no
-        # other worker can modify it until we commit.
+        cursor.execute(
+            """
+            SELECT count(*), count(DISTINCT chunk_index) FROM chunks
+            WHERE tenant_id = %s AND document_id = %s::uuid;
+            """,
+            (tenant_id, document_id),
+        )
+        stored_count, unique_count = cursor.fetchone()
+        if stored_count != expected_chunk_count or unique_count != expected_chunk_count:
+            raise RuntimeError(
+                f"document {document_id} has {stored_count} stored chunks "
+                f"({unique_count} unique); expected {expected_chunk_count}"
+            )
+
         cursor.execute(
             """
             UPDATE documents
@@ -297,52 +410,15 @@ def finalize_document(
             (page_count, content_hash, document_id, generation),
         )
         if cursor.fetchone() is None:
-            # Nothing updated -> a newer version or a delete superseded our claim.
             raise StaleClaimError(f"claim no longer current for document {document_id}")
-
-        # Step 2: remove the chunks of any previous version of this document.
-        cursor.execute(
-            "DELETE FROM chunks WHERE tenant_id = %s AND document_id = %s::uuid",
-            (tenant_id, document_id),
-        )
-
-        # Step 3: build one parameter tuple per chunk.
-        rows = []
-        for item in embedded_chunks:
-            # pg8000 has no native pgvector type; pgvector accepts the text form
-            # "[0.1,0.2,...]" and we cast it with ::vector in the SQL below.
-            embedding_str = "[" + ",".join(str(x) for x in item.embedding) + "]"
-            rows.append(
-                (
-                    tenant_id,
-                    document_id,
-                    item.chunk.chunk_index,
-                    item.chunk.char_start,
-                    item.chunk.char_end,
-                    item.chunk.text,
-                    embedding_str,
-                )
-            )
-
-        # Step 4: insert all new chunks. Parameterised -> safe from SQL injection.
-        cursor.executemany(
-            """
-            INSERT INTO chunks
-                (tenant_id, document_id, chunk_index, char_start, char_end, text, embedding)
-            VALUES
-                (%s, %s::uuid, %s, %s, %s, %s, %s::vector);
-            """,
-            rows,
-        )
-        # No commit() here: tenant_connection commits when this block exits cleanly.
 
     logger.info(
         "document_finalized",
         tenant_id=tenant_id,
         document_id=document_id,
-        chunk_count=len(rows),
+        chunk_count=stored_count,
     )
-    return len(rows)
+    return int(stored_count)
 
 
 def mark_failed(tenant_id: str, document_id: str, generation: int, error: str) -> None:

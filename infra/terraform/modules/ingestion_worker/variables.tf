@@ -20,8 +20,7 @@ variable "raw_docs_bucket_name" {
 
 variable "image" {
   type        = string
-  description = "Initial worker container image. CI redeploys it afterwards (Terraform ignores later image changes)."
-  default     = "us-docker.pkg.dev/cloudrun/container/hello"
+  description = "Worker container image to use when Terraform creates the Cloud Run service. CI deploys versioned images afterwards."
 }
 
 variable "network_name" {
@@ -46,6 +45,6 @@ variable "env" {
 
 variable "max_instances" {
   type        = number
-  default     = 3
+  default     = 1
   description = "Caps parallel ingestion to protect Vertex AI / Document AI quota and DB connections"
 }

@@ -131,22 +131,21 @@ def _search_chunks(
         cursor.execute(
             """
             SELECT
-                document_id,
-                text,
-                1 - (embedding <=> %s::vector) AS similarity
+                chunks.document_id,
+                chunks.text,
+                1 - (chunks.embedding <=> %s::vector) AS similarity
             FROM chunks
-            ORDER BY embedding <=> %s::vector
+            JOIN documents AS d
+              ON d.id = chunks.document_id
+             AND d.tenant_id = chunks.tenant_id
+            WHERE d.status = 'ready'
+            ORDER BY chunks.embedding <=> %s::vector
             LIMIT %s;
             """,
             (query_vector_str, query_vector_str, top_k),
         )
-        # Identical logic to test_retrieval.py's query: <=> is
-        # pgvector's cosine distance operator (matches the
-        # vector_cosine_ops HNSW index built in Step 4.8's schema),
-        # ORDER BY it ascending to get the most similar chunks first,
-        # LIMIT to top_k results. The only addition here is selecting
-        # document_id too, since RetrievedChunk (Step 5.1) tracks
-        # which document each chunk came from.
+        # Only ready documents are searchable; partially persisted batches
+        # stay hidden until ingestion finalizes successfully.
 
         rows = cursor.fetchall()
 

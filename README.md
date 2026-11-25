@@ -92,10 +92,22 @@ Copy `.env.example` to `.env` and fill in the values (see **Configuration** belo
 ```powershell
 cd infra/terraform/environments/dev
 terraform init
+terraform apply -target=module.artifact_registry
+
+# Build and publish the worker image Terraform uses to bootstrap Cloud Run.
+$PROJECT_ID = "project-672c834c-460a-4d65-a9b"
+$WORKER_IMAGE = "us-central1-docker.pkg.dev/$PROJECT_ID/documind/documind-worker:latest"
+cd ..\..\..\..
+gcloud auth configure-docker us-central1-docker.pkg.dev
+docker build -f Dockerfile.worker -t $WORKER_IMAGE .
+docker push $WORKER_IMAGE
+
+# Create the remaining infrastructure, including the Cloud Run worker.
+cd infra\terraform\environments\dev
 terraform apply
 ```
 
-This provisions: a custom-mode VPC with a GKE-ready subnet and private services peering, a Cloud SQL Postgres instance (with `pgvector`), a Cloud Storage bucket for raw document uploads, and a Document AI OCR processor.
+The Artifact Registry image must exist before the full apply creates the Cloud Run worker. CI refreshes the `latest` bootstrap tag on pushes to `main`; normal worker deployments use an immutable commit-SHA tag. This provisions: a custom-mode VPC with a GKE-ready subnet and private services peering, a Cloud SQL Postgres instance (with `pgvector`), a Cloud Storage bucket for raw document uploads, and a Document AI OCR processor.
 
 After every `terraform apply`, refresh generated values into `.env`:
 
@@ -116,7 +128,7 @@ Cloud SQL bills continuously while running. This project is set up to be destroy
 
 ```powershell
 terraform destroy   # end of session
-terraform apply     # start of next session
+# At the next start, repeat the registry/image bootstrap steps above, then run terraform apply.
 ```
 
 Because of this, several values are **not stable across sessions** and must be refreshed each time you resume: the Document AI processor ID, the Cloud SQL instance's public IP, and the database schema/data itself (wiped on every recreate). If your home IP has changed since the last session, also update `authorized_dev_ip` in `terraform.tfvars` before applying.
@@ -142,6 +154,12 @@ python scripts\test_router.py           # router agent in isolation
 python scripts\test_retriever_agent.py  # retriever agent in isolation
 python scripts\test_synthesis_agent.py  # retriever + synthesis chained together
 ```
+
+The event-driven worker embeds at most 10 chunks per minute and commits each
+10-chunk batch to the database. A document remains `processing` until every
+chunk is stored; retrieval only includes documents marked `ready`. If a worker
+retry resumes a partially processed document, it skips matching chunks already
+stored for that generation.
 
 ## Project status
 

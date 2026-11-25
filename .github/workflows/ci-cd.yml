@@ -190,14 +190,14 @@ jobs:
         run: |
           docker build -f Dockerfile.worker -t ${{ env.WORKER_IMAGE }}:${{ github.sha }} .
           docker push ${{ env.WORKER_IMAGE }}:${{ github.sha }}
-        # Tagging with BOTH the commit SHA and "latest" — :latest for
-        # convenience (what our current deployment.yaml references),
-        # and the SHA-specific tag for real traceability: it lets you
-        # look at what's actually running in the cluster and know
-        # EXACTLY which commit produced it, and roll back to a
-        # specific prior version by tag if ever needed. Using only
-        # ":latest" in production is a known anti-pattern precisely
-        # because it loses this traceability.
+
+      - name: Publish worker bootstrap image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker tag ${{ env.WORKER_IMAGE }}:${{ github.sha }} ${{ env.WORKER_IMAGE }}:latest
+          docker push ${{ env.WORKER_IMAGE }}:latest
+        # Terraform uses :latest only when it creates a fresh Cloud Run service.
+        # Normal deployments use the immutable commit SHA below.
 
   deploy:
     runs-on: ubuntu-latest

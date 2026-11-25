@@ -14,7 +14,7 @@ FLOW for object  gs://<bucket>/<tenant>/<file>.pdf
   3. CLAIM this version of the document (idempotency + lease). Duplicate,
      stale, or already-owned versions stop here.
   4. Validate (size, PDF magic bytes) -> parse (Document AI) -> chunk -> embed.
-  5. FINALIZE in one transaction (status 'ready' + chunks swapped in).
+  5. Persist chunks in batches, then mark the document 'ready' only when complete.
   6. Errors: permanent -> mark 'failed'; anything else -> release the claim and
      ask for a retry. A hard attempt cap guarantees we never retry forever.
 
@@ -60,14 +60,17 @@ from documind.db import (
     claim_document,
     delete_document,
     finalize_document,
+    get_document_chunk_texts,
     get_tenant,
     mark_failed,
+    persist_chunk_batch,
     release_claim,
+    reset_document_chunks,
 )
 
 # Existing pipeline steps (unchanged): chunk text, embed chunks, parse via Document AI.
 from documind.ingestion.chunker import chunk_text
-from documind.ingestion.embedder import embed_chunks
+from documind.ingestion.embedder import embed_chunk_batches
 from documind.ingestion.parser import count_pdf_pages, parse_document
 
 logger = structlog.get_logger()
@@ -229,8 +232,11 @@ def ingest_object(bucket_name: str, object_name: str) -> IngestOutcome:
         mark_failed(tenant_id, document_id, generation, message)
         return finish("failed_permanent", tenant_id=tenant_id, document_id=document_id, detail=message)
 
-    # ---- 4 + 5. Do the work, then finalize ----
+    # ---- 4 + 5. Do the work, persist batches, then finalize ----
     try:
+        if claim.attempts == 1:
+            reset_document_chunks(tenant_id, document_id, generation)
+
         _validate_pdf(blob)
 
         with blob.open("rb") as pdf_file:
@@ -243,7 +249,36 @@ def ingest_object(bucket_name: str, object_name: str) -> IngestOutcome:
         if not chunks:
             raise PermanentIngestError("chunker produced no chunks")
 
-        embedded = embed_chunks(chunks)                  # Vertex AI embeddings (may hit 429)
+        persisted_texts = {}
+        if claim.attempts > 1:
+            persisted_texts = get_document_chunk_texts(
+                tenant_id, document_id, generation
+            )
+        chunk_texts = {chunk.chunk_index: chunk.text for chunk in chunks}
+        if any(
+            chunk_texts.get(index) != stored_text
+            for index, stored_text in persisted_texts.items()
+        ):
+            reset_document_chunks(tenant_id, document_id, generation)
+            persisted_texts = {}
+
+        chunks_to_embed = [
+            chunk for chunk in chunks
+            if persisted_texts.get(chunk.chunk_index) != chunk.text
+        ]
+        for embedded_batch in embed_chunk_batches(chunks_to_embed):
+            persist_chunk_batch(
+                tenant_id=tenant_id,
+                document_id=document_id,
+                generation=generation,
+                embedded_chunks=embedded_batch,
+            )
+            logger.info(
+                "ingest_chunk_batch_committed",
+                tenant_id=tenant_id,
+                document_id=document_id,
+                committed_chunks=len(embedded_batch),
+            )
 
         chunk_count = finalize_document(
             tenant_id=tenant_id,
@@ -251,7 +286,7 @@ def ingest_object(bucket_name: str, object_name: str) -> IngestOutcome:
             generation=generation,
             page_count=page_count,
             content_hash=content_hash,
-            embedded_chunks=embedded,
+            expected_chunk_count=len(chunks),
         )
         return finish("ingested", tenant_id=tenant_id, document_id=document_id, chunk_count=chunk_count)
 

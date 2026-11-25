@@ -15,45 +15,50 @@ closest to it — those chunks are handed to the LLM as context.
 
 # --- IMPORTS ---
 
+import time
+from collections.abc import Iterator
+from threading import Lock
+
 import structlog
-# Structured (JSON) logging library, same as every other ingestion module
-# (storage.py, parser.py, chunker.py). Gives us queryable log fields
-# (e.g. total_chunks=42) in Cloud Logging instead of a plain text message.
 
-from pydantic import BaseModel
-# Only BaseModel is needed here — we're defining one simple data model
-# (EmbeddedChunk) with no custom validators, so nothing else from
-# Pydantic is required. Importing only what's used keeps the file's
-# purpose clear at a glance.
-
-from tenacity import retry, stop_after_attempt, wait_exponential
-# The retry library used throughout this project (Secret Manager client,
-# GCS upload, Document AI parsing). Embedding calls go over the network
-# to Vertex AI and can fail transiently — retrying with exponential
-# backoff is the standard production-resilience pattern we're applying
-# consistently across every external call in this codebase.
-
-from vertexai.language_models import TextEmbeddingInput, TextEmbeddingModel
 # Vertex AI SDK classes specific to text embeddings.
 #   - TextEmbeddingModel: the model handle itself (loaded via
 #     from_pretrained), used to actually request embeddings.
 #   - TextEmbeddingInput: wraps a piece of text together with metadata
 #     about *how* it will be used (see task_type explanation below,
 #     inside _embed_batch) — this affects the resulting vector.
-
 import vertexai
+
+# Structured (JSON) logging library, same as every other ingestion module
+# (storage.py, parser.py, chunker.py). Gives us queryable log fields
+# (e.g. total_chunks=42) in Cloud Logging instead of a plain text message.
+from pydantic import BaseModel
+
+# Only BaseModel is needed here — we're defining one simple data model
+# (EmbeddedChunk) with no custom validators, so nothing else from
+# Pydantic is required. Importing only what's used keeps the file's
+# purpose clear at a glance.
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+# The retry library used throughout this project (Secret Manager client,
+# GCS upload, Document AI parsing). Embedding calls go over the network
+# to Vertex AI and can fail transiently — retrying with exponential
+# backoff is the standard production-resilience pattern we're applying
+# consistently across every external call in this codebase.
+from vertexai.language_models import TextEmbeddingInput, TextEmbeddingModel
+
 # The top-level Vertex AI SDK package. Needed for vertexai.init(), which
 # authenticates the SDK and points it at a specific GCP project/region
 # before any model can be loaded. This is a separate, required step —
 # unlike some other GCP clients (e.g. Secret Manager, Storage) that take
 # project= directly in their constructor, Vertex AI's SDK configures
 # itself globally per-process via this init() call.
-
 from documind.config import get_settings
+
 # Our Pydantic Settings loader (Step 4.3) — gives us gcp_project_id,
 # gcp_region, and embedding_model without hardcoding any of them here.
-
 from documind.ingestion.chunker import Chunk
+
 # Reusing the Chunk model defined in chunker.py rather than redefining
 # chunk fields in this file too. One source of truth for "what a chunk
 # looks like" — this module just adds an embedding on top of it.
@@ -69,13 +74,11 @@ logger = structlog.get_logger()
 # --- CONSTANTS ---
 
 _EMBED_BATCH_SIZE = 5
-# How many chunks we send to Vertex AI in a single API call. Leading
-# underscore = internal constant, not meant to be imported by other
-# modules. Batching multiple texts per call reduces network round-trips
-# compared to embedding one chunk at a time, improving both latency and
-# API quota usage. 5 is a conservative starting value — real tuning
-# would push this higher based on the model's actual batch limits and
-# typical chunk sizes.
+_CHUNKS_PER_DB_BATCH = 10
+_CHUNKS_PER_MINUTE = 10
+
+_rate_limit_lock = Lock()
+_next_embedding_request_at = 0.0
 
 
 # --- DATA MODEL ---
@@ -119,11 +122,27 @@ def _init_vertexai() -> None:
     # what we're doing here.
 
 
+def _pace_embedding_request(chunk_count: int) -> None:
+    """Reserve time for a request so input chunks average at most 10 per minute."""
+    global _next_embedding_request_at
+
+    with _rate_limit_lock:
+        now = time.monotonic()
+        scheduled_at = max(now, _next_embedding_request_at)
+        wait_seconds = scheduled_at - now
+        _next_embedding_request_at = scheduled_at + (60 * chunk_count / _CHUNKS_PER_MINUTE)
+
+    if wait_seconds > 0:
+        logger.info("embedding_rate_limit_wait", wait_seconds=round(wait_seconds, 2))
+        time.sleep(wait_seconds)
+
+
 # --- INTERNAL BATCH EMBEDDING HELPER ---
 
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=30),
+    reraise=True,
 )
 # Retries this function up to 3 times if it raises an exception, with
 # exponential backoff between attempts (starting around 2 seconds,
@@ -139,7 +158,7 @@ def _embed_batch(model: TextEmbeddingModel, chunks: list[Chunk]) -> list[Embedde
     chunks 1-46 unnecessarily.
     """
 
-    inputs = [
+    inputs: list[str | TextEmbeddingInput] = [
         TextEmbeddingInput(text=chunk.text, task_type="RETRIEVAL_DOCUMENT")
         for chunk in chunks
     ]
@@ -159,6 +178,7 @@ def _embed_batch(model: TextEmbeddingModel, chunks: list[Chunk]) -> list[Embedde
     # that silently degrades retrieval quality without ever throwing
     # an error — worth remembering.
 
+    _pace_embedding_request(len(chunks))
     embeddings = model.get_embeddings(inputs)
     # The actual API call to Vertex AI. Sends the entire batch in one
     # request; gets back one embedding result per input, in the same
@@ -180,69 +200,38 @@ def _embed_batch(model: TextEmbeddingModel, chunks: list[Chunk]) -> list[Embedde
     # SDK's response object for each embedding.
 
 
-# --- PUBLIC FUNCTION ---
+# --- PUBLIC FUNCTIONS ---
 
-def embed_chunks(chunks: list[Chunk]) -> list[EmbeddedChunk]:
-    """
-    Public entry point: takes a list of Chunk objects (from chunker.py)
-    and returns a list of EmbeddedChunk objects, each carrying its
-    original chunk plus a 768-dimension embedding vector.
-
-    Processes chunks in batches of _EMBED_BATCH_SIZE to balance API
-    efficiency (fewer round-trips than one-at-a-time) against not
-    overwhelming a single request with too much text at once.
-    """
+def embed_chunk_batches(chunks: list[Chunk]) -> Iterator[list[EmbeddedChunk]]:
+    """Embed and yield groups of ten chunks so each group can be persisted."""
+    if not chunks:
+        return
 
     settings = get_settings()
-    # Needed for settings.embedding_model below.
-
     _init_vertexai()
-    # Must run before loading any model — see _init_vertexai() above.
-
     model = TextEmbeddingModel.from_pretrained(settings.embedding_model)
-    # Loads the embedding model handle by name. settings.embedding_model
-    # defaults to "text-embedding-005" (set in config.py, Step 4.3).
-    # This happens once per call to embed_chunks — not once per batch —
-    # avoiding redundant model-loading overhead.
 
-    results: list[EmbeddedChunk] = []
-    # The list we'll build up across all batches and return at the end.
-    # Type-annotated as list[EmbeddedChunk] so mypy --strict can verify
-    # nothing else accidentally gets added to it.
+    total_processed = 0
+    for group_start in range(0, len(chunks), _CHUNKS_PER_DB_BATCH):
+        group = chunks[group_start : group_start + _CHUNKS_PER_DB_BATCH]
+        embedded_group: list[EmbeddedChunk] = []
 
-    for i in range(0, len(chunks), _EMBED_BATCH_SIZE):
-        # range(0, len(chunks), _EMBED_BATCH_SIZE) steps through
-        # indices 0, 5, 10, 15, ... — the standard Python pattern for
-        # walking through a list in fixed-size batches.
+        for batch_start in range(0, len(group), _EMBED_BATCH_SIZE):
+            batch = group[batch_start : batch_start + _EMBED_BATCH_SIZE]
+            embedded_group.extend(_embed_batch(model, batch))
 
-        batch = chunks[i : i + _EMBED_BATCH_SIZE]
-        # Slice out the current batch: chunks i, i+1, ..., i+4 (up to
-        # 5 items, or fewer for the final partial batch).
-
-        embedded_batch = _embed_batch(model, batch)
-        # Embed this one batch (with retry/backoff already applied
-        # inside _embed_batch).
-
-        results.extend(embedded_batch)
-        # .extend() appends each item from embedded_batch individually
-        # onto results — as opposed to .append(), which would nest the
-        # whole batch as one single list-inside-a-list. extend() keeps
-        # `results` as one flat list of EmbeddedChunk objects.
-
+        total_processed += len(embedded_group)
         logger.info(
-            "embedded_batch",
-            batch_start=i,
-            batch_size=len(batch),
-            total_processed=len(results),
+            "embedding_batch_ready",
+            batch_start=group_start,
+            batch_size=len(embedded_group),
+            total_processed=total_processed,
         )
-        # Structured progress log after each batch — useful for
-        # watching a large document's embedding progress in real time
-        # via Cloud Logging, and for spotting exactly where a slowdown
-        # or failure happened in a long-running ingestion job.
+        yield embedded_group
 
-    logger.info("embedding_complete", total_chunks=len(results), model=settings.embedding_model)
-    # Final summary log once all batches are done.
+    logger.info("embedding_complete", total_chunks=total_processed, model=settings.embedding_model)
 
-    return results
-    # Hand back the full list of EmbeddedChunk objects — ready to be
-    # written into Cloud SQL/pgvector in the next step.
+
+def embed_chunks(chunks: list[Chunk]) -> list[EmbeddedChunk]:
+    """Embed all chunks and return them as one list for existing callers."""
+    return [item for batch in embed_chunk_batches(chunks) for item in batch]
